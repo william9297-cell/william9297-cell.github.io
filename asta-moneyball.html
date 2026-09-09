@@ -128,6 +128,7 @@ nav button[aria-selected="true"] i{transform:translateY(-1px)}
 .note{background:var(--surface2);border-left:3px solid var(--gold);border-radius:0 9px 9px 0;padding:10px 12px;
  font-size:13px;line-height:1.5;margin:12px 0}
 .buy{display:flex;gap:9px;margin-top:14px}
+.sbin{background:var(--bg);border:1px solid var(--line);border-radius:11px;padding:11px 13px;font-size:16px;width:100%}
 .buy input{flex:1;background:var(--bg);border:1px solid var(--line);border-radius:11px;padding:13px;font-size:17px;
  font-family:Archivo;font-variant-numeric:tabular-nums;text-align:center;min-width:0}
 .btn{background:var(--accent);color:var(--accent-ink);border-radius:11px;padding:13px 20px;font-weight:600;font-size:15px;flex:0 0 auto}
@@ -218,6 +219,43 @@ details p{font-size:13px;color:var(--muted);line-height:1.55}
       <input id="ntIn" type="number" inputmode="numeric" value="10" min="2" max="16">
       <button class="btn ghost" id="ntBtn">Numero squadre</button>
     </div>
+  </div>
+  <div class="card">
+    <h2>Database condiviso</h2>
+    <p class="sub" id="sbStato">—</p>
+    <div style="display:flex;flex-direction:column;gap:8px">
+      <input id="sbUrl" class="sbin" type="url" inputmode="url" autocomplete="off" placeholder="https://xxxx.supabase.co">
+      <input id="sbKey" class="sbin" type="text" autocomplete="off" placeholder="chiave anon (publishable)">
+      <input id="sbRoom" class="sbin" type="text" autocomplete="off" placeholder="codice asta">
+      <div class="buy" style="margin-top:0">
+        <button class="btn" id="sbSave">Collega</button>
+        <button class="btn ghost" id="sbSql">Copia SQL</button></div>
+    </div>
+    <details><summary>Come si prepara in cinque minuti</summary>
+      <p>1. Crea un progetto gratuito su supabase.com.<br>
+      2. Apri <b>SQL Editor</b>, incolla il blocco qui sotto (il pulsante Copia SQL lo mette negli appunti) ed esegui.<br>
+      3. In <b>Project Settings → API</b> copia la <b>Project URL</b> e la chiave <b>anon</b>, incollale qui sopra e premi Collega.<br>
+      4. Passa lo stesso link, la stessa chiave e lo stesso codice asta all'altra persona.</p>
+      <pre id="sqlTxt" style="background:var(--surface2);border:1px solid var(--line);border-radius:9px;padding:11px;
+        overflow-x:auto;font:400 11.5px/1.5 ui-monospace,Menlo,Consolas,monospace;white-space:pre">create table if not exists asta_picks (
+  room  text not null,
+  player int  not null,
+  team  int  not null,
+  price int  not null,
+  updated_at timestamptz default now(),
+  primary key (room, player)
+);
+create table if not exists asta_config (
+  room text primary key,
+  data jsonb not null,
+  updated_at timestamptz default now()
+);
+alter table asta_picks  enable row level security;
+alter table asta_config enable row level security;
+create policy asta_picks_all  on asta_picks  for all using (true) with check (true);
+create policy asta_config_all on asta_config for all using (true) with check (true);</pre>
+      <p><b>Da sapere:</b> la chiave anon è visibile nella pagina e le regole qui sopra lasciano leggere e scrivere a chiunque la conosca. Per un'asta di fantacalcio va bene, ma tieni il codice asta poco indovinabile e non riusare quel progetto per altro.</p>
+    </details>
   </div>
   <div class="card">
     <h2>Chi può ancora rilanciare</h2>
@@ -338,59 +376,109 @@ function targetDin(r){
 }
 const spesoR=r=>byTeam(0).filter(([i])=>RL[P[i][R]]===r).reduce((a,[,v])=>a+v.p,0);
 
-/* ---------- sincronizzazione ---------- */
+/* ---------- sincronizzazione: Supabase > db Claude > solo locale ---------- */
+const SBKEY='asta-sb-cfg';
+let SB={url:'',key:'',room:''}, backend='off', writeSeq=0, poll=null, lastSig='', lastOk=0;
+try{const r=localStorage.getItem(SBKEY); if(r) SB=Object.assign(SB,JSON.parse(r));}catch(e){}
+if(!SB.room) SB.room='asta-'+Math.random().toString(36).slice(2,8);
+const sbOn=()=>!!(SB.url&&SB.key&&SB.room);
+const sbUrl=p=>SB.url.replace(/\/+$/,'')+'/rest/v1/'+p;
+const sbHead=x=>Object.assign({apikey:SB.key,Authorization:'Bearer '+SB.key,'Content-Type':'application/json'},x||{});
+const RQ=()=>encodeURIComponent(SB.room);
+
 function stato(k,extra){
   const e=$('#sync'); if(!e) return;
-  const m={off:['◦','solo su questo dispositivo'],on:['●','condiviso'],err:['◦','sincronizzazione interrotta']};
-  e.innerHTML=`<span style="color:${k==='on'?'var(--accent)':'var(--faint)'}">${m[k][0]}</span> ${m[k][1]}${extra||''}`;
+  const m={off:['◦','solo su questo dispositivo'],sb:['●','condiviso · Supabase'],
+           cl:['●','condiviso · db Claude'],err:['◦','sincronizzazione interrotta']};
+  const c=(k==='off'||k==='err')?'var(--faint)':'var(--accent)';
+  e.innerHTML=`<span style="color:${c}">${m[k][0]}</span> ${m[k][1]}${extra||''}`;
+  const b=$('#sbStato'); if(b) b.textContent=({off:'Non configurato — i dati restano su questo dispositivo.',
+    sb:'Collegato a Supabase.',cl:'Collegato al database di Claude.',err:'Collegamento interrotto: controlla URL, chiave e tabelle.'})[k];
 }
+
+/* --- Supabase via REST, nessuna libreria esterna --- */
+async function sbPull(){
+  const seq=writeSeq;
+  const [rp,rc]=await Promise.all([
+    fetch(sbUrl(`asta_picks?room=eq.${RQ()}&select=player,team,price`),{headers:sbHead()}),
+    fetch(sbUrl(`asta_config?room=eq.${RQ()}&select=data`),{headers:sbHead()})]);
+  if(!rp.ok||!rc.ok) throw new Error('HTTP '+rp.status+'/'+rc.status);
+  const rows=await rp.json(), cfg=await rc.json();
+  if(seq!==writeSeq) return;              // una scrittura e' avvenuta durante la fetch: scarto
+  const np={}; rows.forEach(r=>{np[r.player]={t:r.team|0,p:r.price|0};});
+  const d=(cfg[0]&&cfg[0].data)||null;
+  const sig=JSON.stringify([np,d]);
+  lastOk=Date.now();
+  if(sig===lastSig) return; lastSig=sig;
+  if(d){ if(typeof d.bud==='number') S.bud=d.bud;
+         if(d.scen&&D.SC[d.scen]) S.scen=d.scen;
+         if(typeof d.nT==='number') S.nT=d.nT;
+         S.teams=normTeams(d.teams,S.nT);
+         $('#budIn').value=S.bud; $('#ntIn').value=S.nT; }
+  if(!rows.length && Object.keys(S.picks).length && !seeded){ $('#seedBox').hidden=false; return; }
+  S.picks=np; seeded=true; save(); render();
+}
+async function sbPush(i,v){
+  writeSeq++;
+  if(v) return fetch(sbUrl('asta_picks'),{method:'POST',headers:sbHead({Prefer:'resolution=merge-duplicates'}),
+    body:JSON.stringify({room:SB.room,player:+i,team:v.t,price:v.p})});
+  return fetch(sbUrl(`asta_picks?room=eq.${RQ()}&player=eq.${+i}`),{method:'DELETE',headers:sbHead()});
+}
+async function sbPushCfg(){
+  writeSeq++;
+  return fetch(sbUrl('asta_config'),{method:'POST',headers:sbHead({Prefer:'resolution=merge-duplicates'}),
+    body:JSON.stringify({room:SB.room,data:{bud:S.bud,scen:S.scen,nT:S.nT,teams:S.teams}})});
+}
+
+/* --- scritture, instradate al backend attivo --- */
 async function pushPick(i,v){
-  if(!DB) return;
-  try{ if(v) await DB.doc('picks/'+i).set({t:v.t,p:v.p,at:Date.now()});
-       else   await DB.doc('picks/'+i).delete(); }
-  catch(e){ toast('Acquisto salvato in locale, non sincronizzato'); }
+  try{
+    if(backend==='sb') await sbPush(i,v);
+    else if(backend==='cl'){ if(v) await DB.doc('picks/'+i).set({t:v.t,p:v.p,at:Date.now()}); else await DB.doc('picks/'+i).delete(); }
+  }catch(e){ toast('Salvato in locale, non sincronizzato'); stato('err'); }
 }
 async function pushConfig(){
-  if(!DB) return;
-  try{ await DB.doc('asta/config').set({bud:S.bud,scen:S.scen,nT:S.nT,teams:S.teams,at:Date.now()}); }
-  catch(e){ toast('Impostazioni non sincronizzate'); }
+  try{
+    if(backend==='sb') await sbPushCfg();
+    else if(backend==='cl') await DB.doc('asta/config').set({bud:S.bud,scen:S.scen,nT:S.nT,teams:S.teams,at:Date.now()});
+  }catch(e){ toast('Impostazioni non sincronizzate'); }
 }
-async function pushMany(entries){   // [[i,v|null],...] a piccoli blocchi
-  if(!DB) return;
-  for(let k=0;k<entries.length;k+=8)
-    await Promise.all(entries.slice(k,k+8).map(([i,v])=>pushPick(i,v).catch(()=>{})));
+async function pushMany(entries){
+  for(let k=0;k<entries.length;k+=6)
+    await Promise.all(entries.slice(k,k+6).map(([i,v])=>pushPick(i,v).catch(()=>{})));
 }
 async function seed(){
-  const e=Object.entries(S.picks).map(([i,v])=>[i,v]);
-  await pushConfig(); await pushMany(e);
-  seeded=true; $('#seedBox').hidden=true; toast('Dati caricati sul database condiviso');
+  await pushConfig(); await pushMany(Object.entries(S.picks));
+  seeded=true; $('#seedBox').hidden=true; lastSig=''; toast('Dati caricati sul database condiviso');
 }
+
 async function connect(){
+  clearInterval(poll); poll=null; backend='off'; lastSig='';
+  if(sbOn()){
+    try{ await sbPull(); backend='sb'; stato('sb');
+         poll=setInterval(()=>{sbPull().catch(()=>stato('err'))},2500); return; }
+    catch(e){ stato('err'); toast('Supabase non raggiungibile: controlla i dati'); }
+  }
   try{ DB=(typeof claude!=='undefined'&&claude.use)?await claude.use('db'):null; }catch(e){ DB=null; }
   if(!DB){ stato('off'); return; }
-  stato('on');
+  backend='cl'; stato('cl');
   DB.doc('asta/config').onSnapshot(sn=>{
-    if(!sn.exists) return; const d=sn.data(); applying=true;
+    if(!sn.exists) return; const d=sn.data();
     if(typeof d.bud==='number') S.bud=d.bud;
     if(d.scen&&D.SC[d.scen]) S.scen=d.scen;
     if(typeof d.nT==='number') S.nT=d.nT;
     S.teams=normTeams(d.teams,S.nT);
-    $('#budIn').value=S.bud; $('#ntIn').value=S.nT;
-    applying=false; save(); render();
+    $('#budIn').value=S.bud; $('#ntIn').value=S.nT; save(); render();
   }, ()=>stato('err'));
   DB.collection('picks').onSnapshot(sn=>{
     const np={}; sn.docs.forEach(d=>{const v=d.data(); if(v&&typeof v.p==='number') np[d.id]={t:v.t|0,p:v.p};});
-    const locali=Object.keys(S.picks).length;
-    if(sn.empty && locali && !seeded && !sn.metadata.fromCache){ $('#seedBox').hidden=false; return; }
+    if(sn.empty && Object.keys(S.picks).length && !seeded && !sn.metadata.fromCache){ $('#seedBox').hidden=false; return; }
     S.picks=np; seeded=true; save(); render();
   }, ()=>stato('err'));
   try{ ROOM=(claude.use)?await claude.use('room'):null; }catch(e){}
-  if(ROOM){ try{ ROOM.presence({app:'asta'}); }catch(e){}
-    ROOM.onPeers(c=>{
-      const altri=c.peers.filter(p=>p.kind==='viewer'&&!p.isMe).length;
-      stato('on', altri?` · ${altri} ${altri===1?'altro collegato':'altri collegati'}`:'');
-    }, ()=>{});
-  }
+  if(ROOM){ try{ROOM.presence({app:'asta'})}catch(e){}
+    ROOM.onPeers(c=>{const a=c.peers.filter(p=>p.kind==='viewer'&&!p.isMe).length;
+      stato('cl',a?` · ${a} ${a===1?'altro collegato':'altri collegati'}`:'')},()=>{}); }
 }
 
 /* ---------- render ---------- */
@@ -597,6 +685,17 @@ $('#resetBtn').onclick=()=>{
   const k=Object.keys(S.picks); S.picks={}; save(); render();
   pushMany(k.map(x=>[x,null])); toast('Asta azzerata')};
 $('#seedBtn').onclick=seed;
+$('#sbUrl').value=SB.url; $('#sbKey').value=SB.key; $('#sbRoom').value=SB.room;
+$('#sbSave').onclick=async()=>{
+  SB={url:$('#sbUrl').value.trim(),key:$('#sbKey').value.trim(),room:($('#sbRoom').value.trim()||SB.room)};
+  try{localStorage.setItem(SBKEY,JSON.stringify(SB))}catch(e){}
+  $('#sbRoom').value=SB.room; toast(sbOn()?'Collego…':'Backend esterno disattivato'); await connect();
+  if(backend==='sb') toast('Collegato a Supabase');
+};
+$('#sbSql').onclick=async()=>{
+  try{await navigator.clipboard.writeText($('#sqlTxt').textContent);toast('SQL copiato')}
+  catch(e){toast('Copia manualmente il blocco SQL')}
+};
 $('#seedNo').onclick=()=>{seeded=true;$('#seedBox').hidden=true;S.picks={};save();render()};
 $('#themeBtn').onclick=()=>{const h=document.documentElement;
   const now=h.getAttribute('data-theme')||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light');
